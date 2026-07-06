@@ -145,6 +145,12 @@ def fetch_all_pages_html() -> list[str]:
             page.wait_for_selector(f"a[href*='/tools/{TOOL_CODE}/accommodations/']", timeout=15000)
         except Exception:
             print("Avertissement: aucun lien de logement détecté après l'attente initiale.")
+
+        print(f"[diagnostic] Titre de la page chargée: {page.title()!r}")
+        print(f"[diagnostic] URL finale après navigation: {page.url!r}")
+        body_snippet = page.inner_text("body")[:500] if page.locator("body").count() else "(pas de <body>)"
+        print(f"[diagnostic] Extrait du texte visible: {body_snippet!r}")
+
         first_html = page.content()
         htmls.append(first_html)
 
