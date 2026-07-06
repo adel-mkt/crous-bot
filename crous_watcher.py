@@ -141,6 +141,10 @@ def fetch_all_pages_html() -> list[str]:
         page = context.new_page()
 
         page.goto(BASE_SEARCH_URL, wait_until="networkidle", timeout=30000)
+        try:
+            page.wait_for_selector(f"a[href*='/tools/{TOOL_CODE}/accommodations/']", timeout=15000)
+        except Exception:
+            print("Avertissement: aucun lien de logement détecté après l'attente initiale.")
         first_html = page.content()
         htmls.append(first_html)
 
@@ -226,12 +230,33 @@ def parse_listings(html: str) -> list[dict]:
     return listings
 
 
+PAGE_LINK_RE = re.compile(r"[?&]page=(\d+)")
+
+
 def get_total_pages(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
+
+    # Stratégie 1 : chercher les liens de pagination (?page=N) et prendre le plus grand.
+    page_numbers = []
+    for link in soup.find_all("a", href=True):
+        m = PAGE_LINK_RE.search(link["href"])
+        if m:
+            page_numbers.append(int(m.group(1)))
+    if page_numbers:
+        return min(max(page_numbers), MAX_PAGES)
+
+    # Stratégie 2 : chercher un texte du type "page 1 sur 60" n'importe où sur la page.
     text = soup.get_text(" ", strip=True)
     m = re.search(r"page\s+1\s+sur\s+(\d+)", text, re.IGNORECASE)
     if m:
         return min(int(m.group(1)), MAX_PAGES)
+
+    # Stratégie 3 : chercher un texte du type "1423 logements" pour au moins savoir
+    # qu'il y a plusieurs pages, sans connaître le nombre exact (fallback prudent).
+    m = re.search(r"(\d[\d\s]*)\s*logements?", text, re.IGNORECASE)
+    if m:
+        print(f"Avertissement: pagination non détectée, mais texte trouvé: {m.group(0)!r}")
+
     return 1
 
 
@@ -258,8 +283,11 @@ def main() -> None:
         print(f"Erreur lors de la récupération des pages: {e}")
         sys.exit(0)  # on ne fait pas planter le cron pour une erreur réseau ponctuelle
 
+    all_listings_count = 0
     for html in pages_html:
-        for listing in parse_listings(html):
+        page_listings = parse_listings(html)
+        all_listings_count += len(page_listings)
+        for listing in page_listings:
             if not matches_target(listing["name"]):
                 continue
             all_matching_ids_this_run.add(listing["id"])
@@ -267,6 +295,8 @@ def main() -> None:
                 continue
             if listing["id"] not in seen:
                 new_matches.append(listing)
+
+    print(f"{all_listings_count} logement(s) détecté(s) au total sur {len(pages_html)} page(s) scannée(s).")
 
     for listing in new_matches:
         price_txt = f"{listing['price']:.0f} €" if listing["price"] else "prix non détecté"
