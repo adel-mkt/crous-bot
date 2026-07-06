@@ -64,8 +64,19 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://trouverunlogement.lescrous.fr/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+# Session réutilisée pour toutes les requêtes, pour garder les cookies obtenus
+# lors de la première visite (certains sites bloquent les requêtes "à froid"
+# sans session/cookies, typique des protections anti-bot).
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 ACCOMMODATION_RE = re.compile(rf"/tools/{TOOL_CODE}/accommodations/(\d+)")
 PRICE_RE = re.compile(r"(\d[\d\s]*(?:,\d+)?)\s*€")
@@ -124,9 +135,19 @@ def send_telegram(message: str) -> None:
 # Scraping
 # ----------------------------------------------------------------------------
 
+def warm_up_session() -> None:
+    """Visite la page d'accueil d'abord, pour obtenir des cookies de session
+    avant d'attaquer les pages de résultats (certaines protections anti-bot
+    bloquent les requêtes qui arrivent directement sans passer par l'accueil)."""
+    try:
+        SESSION.get("https://trouverunlogement.lescrous.fr/", timeout=20)
+    except requests.RequestException as e:
+        print(f"Avertissement: échec du warm-up de session ({e}), on continue quand même.")
+
+
 def fetch_page(page: int) -> str:
     params = {} if page <= 1 else {"page": page}
-    resp = requests.get(BASE_SEARCH_URL, params=params, headers=HEADERS, timeout=20)
+    resp = SESSION.get(BASE_SEARCH_URL, params=params, timeout=20)
     resp.raise_for_status()
     return resp.text
 
@@ -219,11 +240,18 @@ def main() -> None:
     new_matches = []
     all_matching_ids_this_run = set()
 
+    warm_up_session()
+
     try:
         first_page_html = fetch_page(1)
+    except requests.HTTPError as e:
+        body_snippet = e.response.text[:300] if e.response is not None else ""
+        print(f"Erreur HTTP sur la page 1: {e}")
+        print(f"Début de la réponse du serveur: {body_snippet!r}")
+        sys.exit(0)  # on ne fait pas planter le cron pour une erreur réseau ponctuelle
     except requests.RequestException as e:
         print(f"Erreur réseau sur la page 1: {e}")
-        sys.exit(0)  # on ne fait pas planter le cron pour une erreur réseau ponctuelle
+        sys.exit(0)
 
     total_pages = get_total_pages(first_page_html)
     print(f"{total_pages} pages à scanner.")
