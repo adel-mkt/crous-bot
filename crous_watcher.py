@@ -17,6 +17,7 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ----------------------------------------------------------------------------
 # CONFIGURATION — à adapter
@@ -62,21 +63,10 @@ SEEN_FILE = Path(__file__).parent / "seen_offers.json"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://trouverunlogement.lescrous.fr/",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-# Session réutilisée pour toutes les requêtes, pour garder les cookies obtenus
-# lors de la première visite (certains sites bloquent les requêtes "à froid"
-# sans session/cookies, typique des protections anti-bot).
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 ACCOMMODATION_RE = re.compile(rf"/tools/{TOOL_CODE}/accommodations/(\d+)")
 PRICE_RE = re.compile(r"(\d[\d\s]*(?:,\d+)?)\s*€")
@@ -135,21 +125,43 @@ def send_telegram(message: str) -> None:
 # Scraping
 # ----------------------------------------------------------------------------
 
-def warm_up_session() -> None:
-    """Visite la page d'accueil d'abord, pour obtenir des cookies de session
-    avant d'attaquer les pages de résultats (certaines protections anti-bot
-    bloquent les requêtes qui arrivent directement sans passer par l'accueil)."""
-    try:
-        SESSION.get("https://trouverunlogement.lescrous.fr/", timeout=20)
-    except requests.RequestException as e:
-        print(f"Avertissement: échec du warm-up de session ({e}), on continue quand même.")
+def fetch_all_pages_html() -> list[str]:
+    """
+    Récupère le HTML de toutes les pages de résultats en pilotant un vrai
+    navigateur headless (Chromium via Playwright). Nécessaire car le site
+    exécute du JavaScript et bloque les simples requêtes HTTP brutes.
+    """
+    htmls = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        context = browser.new_context(
+            locale="fr-FR",
+            user_agent=BROWSER_USER_AGENT,
+        )
+        page = context.new_page()
 
+        page.goto(BASE_SEARCH_URL, wait_until="networkidle", timeout=30000)
+        first_html = page.content()
+        htmls.append(first_html)
 
-def fetch_page(page: int) -> str:
-    params = {} if page <= 1 else {"page": page}
-    resp = SESSION.get(BASE_SEARCH_URL, params=params, timeout=20)
-    resp.raise_for_status()
-    return resp.text
+        total_pages = get_total_pages(first_html)
+        print(f"{total_pages} pages à scanner.")
+
+        for page_num in range(2, total_pages + 1):
+            time.sleep(DELAY_BETWEEN_PAGES)
+            try:
+                page.goto(
+                    f"{BASE_SEARCH_URL}?page={page_num}",
+                    wait_until="networkidle",
+                    timeout=30000,
+                )
+                htmls.append(page.content())
+            except Exception as e:  # navigation timeout, etc.
+                print(f"Erreur sur la page {page_num}: {e}")
+                continue
+
+        browser.close()
+    return htmls
 
 
 def parse_listings(html: str) -> list[dict]:
@@ -240,30 +252,11 @@ def main() -> None:
     new_matches = []
     all_matching_ids_this_run = set()
 
-    warm_up_session()
-
     try:
-        first_page_html = fetch_page(1)
-    except requests.HTTPError as e:
-        body_snippet = e.response.text[:300] if e.response is not None else ""
-        print(f"Erreur HTTP sur la page 1: {e}")
-        print(f"Début de la réponse du serveur: {body_snippet!r}")
+        pages_html = fetch_all_pages_html()
+    except Exception as e:
+        print(f"Erreur lors de la récupération des pages: {e}")
         sys.exit(0)  # on ne fait pas planter le cron pour une erreur réseau ponctuelle
-    except requests.RequestException as e:
-        print(f"Erreur réseau sur la page 1: {e}")
-        sys.exit(0)
-
-    total_pages = get_total_pages(first_page_html)
-    print(f"{total_pages} pages à scanner.")
-
-    pages_html = [first_page_html]
-    for page in range(2, total_pages + 1):
-        time.sleep(DELAY_BETWEEN_PAGES)
-        try:
-            pages_html.append(fetch_page(page))
-        except requests.RequestException as e:
-            print(f"Erreur réseau sur la page {page}: {e}")
-            continue
 
     for html in pages_html:
         for listing in parse_listings(html):
